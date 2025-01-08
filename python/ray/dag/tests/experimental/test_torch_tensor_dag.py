@@ -13,10 +13,10 @@ import torch
 import time
 from ray.air._internal import torch_utils
 from ray.dag import InputNode
-from ray.exceptions import RayChannelError
+from ray.exceptions import RayChannelError, RayTaskError
 from ray.dag.output_node import MultiOutputNode
-from ray.experimental.channel.gpu_communicator import (
-    GPUCommunicator,
+from ray.experimental.channel.communicator import (
+    Communicator,
     TorchTensorAllocator,
 )
 from ray.experimental.channel.nccl_group import _NcclGroup
@@ -64,6 +64,9 @@ class TorchTensorWorker:
             raise RuntimeError()
         return torch.ones(shape, dtype=dtype, device=self.device) * value
 
+    def send_int(self, value: int):
+        return value
+
     def recv(self, tensor):
         # Check that tensor got loaded to the correct device.
         assert tensor.device == self.device
@@ -100,6 +103,12 @@ class TorchTensorWorker:
 
     def ping(self):
         return
+
+    @ray.method(num_returns=2)
+    def return_two_tensors(
+        self, t1: torch.Tensor, t2: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return t1, t2
 
 
 @ray.remote(num_cpus=1)
@@ -212,7 +221,9 @@ def test_torch_tensor_nccl(
         sum(node["Resources"].get("GPU", 0) for node in ray.nodes()) > 1
     ), "This test requires at least 2 GPUs"
 
-    monkeypatch.setattr(ray.dag.constants, "RAY_CG_ENABLE_PROFILING", enable_profiling)
+    monkeypatch.setattr(
+        ray.dag.constants, "RAY_CGRAPH_ENABLE_PROFILING", enable_profiling
+    )
 
     actor_cls = TorchTensorWorker.options(num_cpus=0, num_gpus=1)
 
@@ -363,7 +374,7 @@ def test_torch_tensor_custom_comm(ray_start_regular):
     sender = actor_cls.remote()
     receiver = actor_cls.remote()
 
-    class TestNcclGroup(GPUCommunicator):
+    class TestNcclGroup(Communicator):
         """
         A custom NCCL group for testing. This is a simple wrapper around `_NcclGroup`.
         """
@@ -440,6 +451,9 @@ def test_torch_tensor_custom_comm(ray_start_regular):
         def destroy(self) -> None:
             return self._inner.destroy()
 
+        def get_transport_name(self) -> str:
+            return "nccl"
+
     from cupy.cuda import nccl
 
     comm_id = nccl.get_unique_id()
@@ -478,7 +492,7 @@ def test_torch_tensor_custom_comm_invalid(ray_start_regular):
     actor1 = actor_cls.remote()
     actor2 = actor_cls.remote()
 
-    class MockNcclGroup(GPUCommunicator):
+    class MockNcclGroup(Communicator):
         """
         A mock NCCL group for testing. Send and recv are not implemented.
         """
@@ -546,6 +560,9 @@ def test_torch_tensor_custom_comm_invalid(ray_start_regular):
         def destroy(self) -> None:
             pass
 
+        def get_transport_name(self) -> str:
+            return "nccl"
+
     nccl_group = MockNcclGroup(2, [actor1, actor2])
 
     # Mixed usage of NCCL groups should throw an error
@@ -559,7 +576,7 @@ def test_torch_tensor_custom_comm_invalid(ray_start_regular):
         dag = actor1.recv.bind(dag)
     with pytest.raises(
         ValueError,
-        match=r"Accelerated DAGs do not support mixed usage of type hints.*",
+        match=r"Compiled Graphs do not support mixed usage of type hints.*",
     ):
         dag.experimental_compile()
 
@@ -573,7 +590,7 @@ def test_torch_tensor_custom_comm_invalid(ray_start_regular):
         dag = actor1.recv.bind(dag)
     with pytest.raises(
         ValueError,
-        match=r"Accelerated DAGs do not support mixed usage of type hints.*",
+        match=r"Compiled Graphs do not support mixed usage of type hints.*",
     ):
         dag.experimental_compile()
 
@@ -590,7 +607,7 @@ def test_torch_tensor_custom_comm_invalid(ray_start_regular):
     with pytest.raises(
         ValueError,
         match=(
-            "Accelerated DAGs currently only support "
+            "Compiled Graphs currently only support "
             "a single custom NCCL group, but multiple "
             "have been specified."
         ),
@@ -627,7 +644,7 @@ def test_torch_tensor_custom_comm_inited(ray_start_regular):
     ]
     ray.wait(refs)
 
-    class InitedNcclGroup(GPUCommunicator):
+    class InitedNcclGroup(Communicator):
         """
         A custom NCCL group based on existing torch.distributed setup.
         """
@@ -701,6 +718,9 @@ def test_torch_tensor_custom_comm_inited(ray_start_regular):
         def destroy(self) -> None:
             pass
 
+        def get_transport_name(self) -> str:
+            return "nccl"
+
     nccl_group = InitedNcclGroup(2, [sender, receiver])
 
     with InputNode() as inp:
@@ -753,7 +773,7 @@ def test_torch_tensor_nccl_static_shape(ray_start_regular):
 
     # Error is thrown if we send the wrong shape. Currently the receiver cannot
     # catch the exception so the DAG cannot be used again.
-    with pytest.raises(RayChannelError):
+    with pytest.raises(RayTaskError):
         ref = compiled_dag.execute(i, shape=(20,), dtype=dtype)
         ray.get(ref)
 
@@ -791,7 +811,7 @@ def test_torch_tensor_nccl_direct_return(ray_start_regular):
     # Error is thrown if we do not send a tensor. Currently the receiver cannot
     # catch the exception so the DAG cannot be used again.
     ref = compiled_dag.execute(value=i, shape=shape, dtype=dtype, send_tensor=False)
-    with pytest.raises(RayChannelError):
+    with pytest.raises(RayTaskError):
         ray.get(ref)
 
     with pytest.raises(RayChannelError):
@@ -840,7 +860,7 @@ def test_torch_tensor_exceptions(
     ray_start_regular, static_shape, direct_return, overlap_gpu_communication
 ):
     """
-    Test exceptions being thrown by a NCCL sending task.
+    Test exceptions being thrown by a NCCL sending task's execution.
     """
     if not USE_GPU:
         pytest.skip("NCCL tests require GPUs")
@@ -893,10 +913,9 @@ def test_torch_tensor_exceptions(
         value=i,
         raise_exception=True,
     )
+
     if static_shape or direct_return:
-        with pytest.raises(RayChannelError):
-            # TODO(swang): Ideally return the RuntimeError thrown by the
-            # application instead of a generic RayChannelError.
+        with pytest.raises(RuntimeError):
             ray.get(ref)
 
         with pytest.raises(RayChannelError):
@@ -921,6 +940,53 @@ def test_torch_tensor_exceptions(
         )
         result = ray.get(ref)
         assert result == (i, shape, dtype)
+
+
+@pytest.mark.parametrize("ray_start_regular", [{"num_cpus": 4}], indirect=True)
+def test_torch_tensor_exceptions2(
+    ray_start_regular,
+):
+    """
+    Test exceptions being thrown by a NCCL sending task's write operation.
+    """
+    if not USE_GPU:
+        pytest.skip("NCCL tests require GPUs")
+
+    assert (
+        sum(node["Resources"].get("GPU", 0) for node in ray.nodes()) > 1
+    ), "This test requires at least 2 GPUs"
+
+    actor_cls = TorchTensorWorker.options(num_gpus=1)
+    sender = actor_cls.remote()
+    receiver = actor_cls.remote()
+
+    with InputNode() as inp:
+        dag = sender.send_int.bind(inp)
+        dag = dag.with_type_hint(
+            TorchTensorType(
+                transport="nccl",
+                _direct_return=True,
+                _static_shape=True,
+            )
+        )
+        dag = receiver.recv.bind(dag)
+
+    compiled_dag = dag.experimental_compile()
+
+    ref = compiled_dag.execute(1)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Task annotated with _direct_return=True must return a "
+            "CUDA torch.Tensor, instead found value `1`. "
+            "DAG will shut down."
+        ),
+    ):
+        ray.get(ref)
+
+    with pytest.raises(RayChannelError):
+        # The DAG is not usable after the exception.
+        ref = compiled_dag.execute(2)
 
 
 @pytest.mark.parametrize("ray_start_regular", [{"num_cpus": 4}], indirect=True)
@@ -1082,7 +1148,7 @@ def test_torch_tensor_nccl_all_reduce_custom_comm(ray_start_regular):
 
     from cupy.cuda import nccl
 
-    class TestNcclGroup(GPUCommunicator):
+    class TestNcclGroup(Communicator):
         """
         A custom NCCL group for testing. This is a simple wrapper around `_NcclGroup`.
         """
@@ -1158,6 +1224,9 @@ def test_torch_tensor_nccl_all_reduce_custom_comm(ray_start_regular):
 
         def destroy(self) -> None:
             return self._inner.destroy()
+
+        def get_transport_name(self) -> str:
+            return "nccl"
 
     comm_id = nccl.get_unique_id()
     nccl_group = TestNcclGroup(2, comm_id, workers)
@@ -1243,9 +1312,46 @@ def test_torch_tensor_nccl_all_reduce_scheduling(ray_start_regular):
     assert result[2] == (value, shape, dtype)
 
 
+@pytest.mark.parametrize("ray_start_regular", [{"num_cpus": 4}], indirect=True)
+def test_nccl_all_reduce_with_class_method_output_node(ray_start_regular):
+    """
+    Test all-reduce with class method output node.
+    """
+    if not USE_GPU:
+        pytest.skip("NCCL tests require GPUs")
+
+    assert (
+        sum(node["Resources"].get("GPU", 0) for node in ray.nodes()) > 1
+    ), "This test requires at least 2 GPUs"
+
+    actor_cls = TorchTensorWorker.options(num_cpus=0, num_gpus=1)
+
+    num_workers = 2
+    workers = [actor_cls.remote() for _ in range(num_workers)]
+
+    with InputNode() as inp:
+        t1, t2 = workers[0].return_two_tensors.bind(inp[0], inp[1])
+        t3, t4 = workers[1].return_two_tensors.bind(inp[2], inp[3])
+        tensors = collective.allreduce.bind([t1, t4], ReduceOp.SUM)
+        dag = MultiOutputNode(tensors + [t2, t3])
+
+    compiled_dag = dag.experimental_compile()
+
+    t1 = torch.tensor([1], device="cuda")
+    t2 = torch.tensor([2], device="cuda")
+    t3 = torch.tensor([3], device="cuda")
+    t4 = torch.tensor([4], device="cuda")
+
+    for i in range(3):
+        i += 1
+        ref = compiled_dag.execute(t1, t2, t3, t4)
+        result = ray.get(ref)
+        assert result == [t1 + t4, t1 + t4, t2, t3]
+
+
 @pytest.mark.parametrize("ray_start_regular", [{"num_cpus": 2}], indirect=True)
 def test_tensor_writable_warning_suppressed(ray_start_regular):
-    """When we move cpu tensor to gpu, aDAG does zero-copy with is_wriatble=False.
+    """When we move cpu tensor to gpu, Compiled Graph does zero-copy with is_writable=False.
     Torch doesn't like it, so it prints warning. We know that it is safe to do it,
     so Ray suppress the warning message. This test verifies the warning is not
     printed in this scenario.

@@ -5,15 +5,19 @@ import sys
 import signal
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Tuple
+from typing import List
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from ray._private.state_api_test_utils import get_state_api_manager
+from ray._private.state_api_test_utils import (
+    get_state_api_manager,
+    create_api_options,
+    verify_schema,
+)
 from ray.util.state import get_job
 from ray.dashboard.modules.job.pydantic_models import JobDetails
-from ray.util.state.common import Humanify, PredicateType
+from ray.util.state.common import Humanify
 from ray._private.gcs_utils import GcsAioClient
 import yaml
 from click.testing import CliRunner
@@ -70,8 +74,8 @@ from ray.dashboard.state_aggregator import (
     GCS_QUERY_FAILURE_WARNING,
     NODE_QUERY_FAILURE_WARNING,
     StateAPIManager,
-    _convert_filters_type,
 )
+from ray.dashboard.state_api_utils import convert_filters_type
 from ray.util.state import (
     get_actor,
     get_node,
@@ -93,9 +97,7 @@ from ray.util.state import (
     list_cluster_events,
     StateApiClient,
 )
-from ray._private.event.event_logger import get_event_id
 from ray.util.state.common import (
-    DEFAULT_LIMIT,
     DEFAULT_RPC_TIMEOUT,
     ActorState,
     ListApiOptions,
@@ -104,10 +106,8 @@ from ray.util.state.common import (
     ObjectState,
     PlacementGroupState,
     RuntimeEnvState,
-    SupportedFilterType,
     TaskState,
     WorkerState,
-    ClusterEventState,
     StateSchema,
     state_column,
 )
@@ -161,23 +161,6 @@ async def state_api_manager_e2e(ray_start_with_dashboard):
     gcs_address = address_info["gcs_address"]
     manager = get_state_api_manager(gcs_address)
     yield manager
-
-
-def verify_schema(state, result_dict: dict, detail: bool = False):
-    state_fields_columns = set()
-    if detail:
-        state_fields_columns = state.columns()
-    else:
-        state_fields_columns = state.base_columns()
-
-    for k in state_fields_columns:
-        assert k in result_dict
-
-    for k in result_dict:
-        assert k in state_fields_columns
-
-    # Make the field values can be converted without error as well
-    state(**result_dict)
 
 
 def generate_actor_data(id, state=ActorTableData.ActorState.ALIVE, class_name="class"):
@@ -346,25 +329,6 @@ def generate_runtime_env_info(runtime_env, creation_time=None, success=True):
             )
         ],
         total=1,
-    )
-
-
-def create_api_options(
-    timeout: int = DEFAULT_RPC_TIMEOUT,
-    limit: int = DEFAULT_LIMIT,
-    filters: List[Tuple[str, PredicateType, SupportedFilterType]] = None,
-    detail: bool = False,
-    exclude_driver: bool = True,
-):
-    if not filters:
-        filters = []
-    return ListApiOptions(
-        limit=limit,
-        timeout=timeout,
-        filters=filters,
-        server_timeout_multiplier=1.0,
-        detail=detail,
-        exclude_driver=exclude_driver,
     )
 
 
@@ -784,65 +748,6 @@ async def test_api_manager_list_pgs(state_api_manager):
             option=create_api_options(limit=1)
         )
     assert exc_info.value.args[0] == GCS_QUERY_FAILURE_WARNING
-
-
-@pytest.mark.asyncio
-async def test_api_manager_list_cluster_events(state_api_manager):
-    data_source_client = state_api_manager.data_source_client
-    event_id_1 = get_event_id()
-    event_id_2 = get_event_id()
-    data_source_client.get_all_cluster_events.return_value = {
-        "job_1": {
-            event_id_1: {
-                "timestamp": 10,
-                "severity": "DEBUG",
-                "message": "a",
-                "event_id": event_id_1,
-                "source_type": "GCS",
-            },
-            event_id_2: {
-                "timestamp": 10,
-                "severity": "INFO",
-                "message": "b",
-                "event_id": event_id_2,
-                "source_type": "GCS",
-            },
-        }
-    }
-    result = await state_api_manager.list_cluster_events(option=create_api_options())
-    data = result.result
-    data = data[0]
-    verify_schema(ClusterEventState, data)
-    assert result.total == 2
-
-    """
-    Test detail
-    """
-    # TODO(sang)
-
-    """
-    Test limit
-    """
-    assert len(result.result) == 2
-    result = await state_api_manager.list_cluster_events(
-        option=create_api_options(limit=1)
-    )
-    data = result.result
-    assert len(data) == 1
-    assert result.total == 2
-
-    """
-    Test filters
-    """
-    # If the column is not supported for filtering, it should raise an exception.
-    with pytest.raises(ValueError):
-        result = await state_api_manager.list_cluster_events(
-            option=create_api_options(filters=[("time", "=", "20")])
-        )
-    result = await state_api_manager.list_cluster_events(
-        option=create_api_options(filters=[("severity", "=", "INFO")])
-    )
-    assert len(result.result) == 1
 
 
 @pytest.mark.asyncio
@@ -1616,39 +1521,39 @@ async def test_filter_non_existent_column(state_api_manager):
 
 def test_type_conversion():
     # Test string
-    r = _convert_filters_type([("actor_id", "=", "123")], ActorState)
+    r = convert_filters_type([("actor_id", "=", "123")], ActorState)
     assert r[0][2] == "123"
-    r = _convert_filters_type([("actor_id", "=", "abcd")], ActorState)
+    r = convert_filters_type([("actor_id", "=", "abcd")], ActorState)
     assert r[0][2] == "abcd"
-    r = _convert_filters_type([("actor_id", "=", "True")], ActorState)
+    r = convert_filters_type([("actor_id", "=", "True")], ActorState)
     assert r[0][2] == "True"
 
     # Test boolean
-    r = _convert_filters_type([("success", "=", "1")], RuntimeEnvState)
+    r = convert_filters_type([("success", "=", "1")], RuntimeEnvState)
     assert r[0][2]
-    r = _convert_filters_type([("success", "=", "True")], RuntimeEnvState)
+    r = convert_filters_type([("success", "=", "True")], RuntimeEnvState)
     assert r[0][2]
-    r = _convert_filters_type([("success", "=", "true")], RuntimeEnvState)
+    r = convert_filters_type([("success", "=", "true")], RuntimeEnvState)
     assert r[0][2]
     with pytest.raises(ValueError):
-        r = _convert_filters_type([("success", "=", "random_string")], RuntimeEnvState)
-    r = _convert_filters_type([("success", "=", "false")], RuntimeEnvState)
+        r = convert_filters_type([("success", "=", "random_string")], RuntimeEnvState)
+    r = convert_filters_type([("success", "=", "false")], RuntimeEnvState)
     assert r[0][2] is False
-    r = _convert_filters_type([("success", "=", "False")], RuntimeEnvState)
+    r = convert_filters_type([("success", "=", "False")], RuntimeEnvState)
     assert r[0][2] is False
-    r = _convert_filters_type([("success", "=", "0")], RuntimeEnvState)
+    r = convert_filters_type([("success", "=", "0")], RuntimeEnvState)
     assert r[0][2] is False
 
     # Test int
-    r = _convert_filters_type([("pid", "=", "0")], ObjectState)
+    r = convert_filters_type([("pid", "=", "0")], ObjectState)
     assert r[0][2] == 0
-    r = _convert_filters_type([("pid", "=", "123")], ObjectState)
+    r = convert_filters_type([("pid", "=", "123")], ObjectState)
     assert r[0][2] == 123
     # Only integer can be provided.
     with pytest.raises(ValueError):
-        r = _convert_filters_type([("pid", "=", "123.3")], ObjectState)
+        r = convert_filters_type([("pid", "=", "123.3")], ObjectState)
     with pytest.raises(ValueError):
-        r = _convert_filters_type([("pid", "=", "abc")], ObjectState)
+        r = convert_filters_type([("pid", "=", "abc")], ObjectState)
 
     # currently, there's no schema that has float column.
 
@@ -2613,6 +2518,83 @@ def test_list_get_tasks(shutdown_only):
         tasks = list_tasks(filters=[("STATE", "=", "PENDING_ARGS_AVAIL")], limit=1)
         assert len(tasks) == 1
 
+        return True
+
+    wait_for_condition(verify)
+    print(list_tasks())
+
+
+def test_list_get_tasks_call_site(shutdown_only):
+    """
+    Call chain: Driver -> caller -> callee.
+    Verify that the call site is captured in callee, and it contains string
+    "caller".
+    """
+    ray.init(
+        num_cpus=2,
+        runtime_env={"env_vars": {"RAY_record_task_actor_creation_sites": "true"}},
+    )
+
+    @ray.remote
+    def callee():
+        import time
+
+        time.sleep(30)
+
+    @ray.remote
+    def caller():
+        return callee.remote()
+
+    caller_ref = caller.remote()
+    callee_ref = ray.get(caller_ref)
+
+    def verify():
+        callee_task = get_task(callee_ref)
+        assert callee_task["call_site"] is not None
+        assert "caller" in callee_task["call_site"]
+        return True
+
+    wait_for_condition(verify)
+    print(list_tasks())
+
+
+def test_list_actor_tasks_call_site(shutdown_only):
+    """
+    Call chain: Driver -> create_actor -> (Actor, Actor.method).
+
+    Verify that the call sites are captured in both Actor and Actor.method,
+    and they contain string "create_actor".
+    """
+    ray.init(
+        num_cpus=2,
+        runtime_env={"env_vars": {"RAY_record_task_actor_creation_sites": "true"}},
+    )
+
+    @ray.remote
+    class Actor:
+        def method(self):
+            import time
+
+            time.sleep(30)
+
+    @ray.remote
+    def create_actor():
+        a = Actor.remote()
+        m_ref = a.method.remote()
+        return a, m_ref
+
+    actor_ref, method_ref = ray.get(create_actor.remote())
+
+    def verify():
+        method_task = get_task(method_ref)
+        assert method_task["call_site"] is not None
+        assert "create_actor" in method_task["call_site"]
+
+        actors = list_actors(detail=True)
+        assert len(actors) == 1
+        actor = actors[0]
+        assert actor["call_site"] is not None
+        assert "create_actor" in actor["call_site"]
         return True
 
     wait_for_condition(verify)
